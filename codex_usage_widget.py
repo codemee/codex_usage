@@ -209,8 +209,39 @@ def read_windows_user_locale() -> str | None:
     return None
 
 
+def read_macos_user_language() -> str | None:
+    if sys.platform != "darwin":
+        return None
+
+    try:
+        completed = subprocess.run(
+            ["defaults", "read", "-g", "AppleLanguages"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except Exception:
+        return None
+
+    if completed.returncode != 0:
+        return None
+
+    for raw_line in completed.stdout.splitlines():
+        language = raw_line.strip().strip('",')
+        if language and language not in {"(", ")"}:
+            return language
+    return None
+
+
 def detect_system_language() -> str:
-    language_code = read_windows_user_locale() or locale.getlocale()[0] or locale.getlocale(locale.LC_CTYPE)[0] or ""
+    language_code = (
+        read_windows_user_locale()
+        or read_macos_user_language()
+        or locale.getlocale()[0]
+        or locale.getlocale(locale.LC_CTYPE)[0]
+        or ""
+    )
     return _normalize_language_code(language_code)
 
 
@@ -275,47 +306,58 @@ def format_tray_tooltip(title: str, remaining_percent: float | None) -> str:
     return f"{title}: {remaining_percent:.0f}%"
 
 
+def _load_tray_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
+    candidates = [
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "Arial Bold.ttf" if bold else "Arial.ttf",
+        "Helvetica.ttc",
+        "segoeuib.ttf" if bold else "segoeui.ttf",
+    ]
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _fit_tray_font(draw: ImageDraw.ImageDraw, text: str, size: int) -> ImageFont.ImageFont:
+    max_width = int(size * 0.78)
+    max_height = int(size * 0.62)
+    for font_size in range(int(size * 0.76), int(size * 0.28), -1):
+        font = _load_tray_font(font_size, bold=True)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        if bbox[2] - bbox[0] <= max_width and bbox[3] - bbox[1] <= max_height:
+            return font
+    return _load_tray_font(max(18, size // 2), bold=True)
+
+
 def create_tray_icon_image(remaining_percent: float | None, theme_name: str = "dark", size: int = 64) -> Image.Image:
     theme = THEMES.get(theme_name, THEMES["dark"])
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    inset = max(3, size // 16)
+    inset = max(2, size // 24)
     draw.rounded_rectangle(
         (inset, inset, size - inset, size - inset),
-        radius=max(8, size // 5),
+        radius=max(7, size // 6),
         fill=theme["card_bg"],
         outline=theme["card_border"],
-        width=max(2, size // 18),
+        width=max(1, size // 24),
     )
 
     text = "--" if remaining_percent is None else f"{remaining_percent:.0f}"
-    try:
-        font = ImageFont.truetype("segoeuib.ttf", max(18, size // 2))
-    except OSError:
-        font = ImageFont.load_default()
+    font = _fit_tray_font(draw, text, size)
 
     bbox = draw.textbbox((0, 0), text, font=font)
     text_width = bbox[2] - bbox[0]
     text_height = bbox[3] - bbox[1]
     draw.text(
-        ((size - text_width) / 2, (size - text_height) / 2 - size * 0.06),
+        ((size - text_width) / 2 - bbox[0], (size - text_height) / 2 - bbox[1] - size * 0.02),
         text,
         font=font,
         fill=theme["text"],
     )
-
-    if remaining_percent is not None:
-        try:
-            percent_font = ImageFont.truetype("segoeui.ttf", max(8, size // 6))
-        except OSError:
-            percent_font = ImageFont.load_default()
-        percent_bbox = draw.textbbox((0, 0), "%", font=percent_font)
-        draw.text(
-            ((size - (percent_bbox[2] - percent_bbox[0])) / 2, size - inset - (percent_bbox[3] - percent_bbox[1]) - 2),
-            "%",
-            font=percent_font,
-            fill=theme["muted"],
-        )
 
     return image
 
@@ -457,6 +499,20 @@ class AppServerClient:
                 process.terminate()
         except Exception:
             pass
+
+        reader_thread = self._reader_thread
+        if reader_thread is not None and reader_thread.is_alive():
+            reader_thread.join(timeout=1)
+
+        try:
+            if process.poll() is None:
+                process.kill()
+        except Exception:
+            pass
+
+        if reader_thread is not None and reader_thread.is_alive():
+            reader_thread.join(timeout=1)
+        self._reader_thread = None
 
     def request(
         self,
@@ -637,11 +693,19 @@ class SystemTrayController:
         self.stop()
 
 
+def _is_interactive_control(widget: tk.Widget) -> bool:
+    return isinstance(widget, (tk.Button, tk.Scale, ttk.Scale)) or bool(getattr(widget, "_usage_widget_control", False))
+
+
 class UsageWidget:
     def __init__(self, root: tk.Tk, enable_tray: bool = True) -> None:
         self.root = root
+        self.show_on_start = root.state() != "withdrawn"
+        if self.show_on_start:
+            self.root.withdraw()
         self.client: AppServerClient | None = None
         self.worker_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.tray_action_queue: queue.Queue[str] = queue.Queue()
         self.last_snapshots: list[RateLimitSnapshot] = []
         self.next_refresh_job: str | None = None
         self.drag_start: tuple[int, int] | None = None
@@ -661,14 +725,14 @@ class UsageWidget:
             title_factory=lambda: self._t("title"),
             show_label_factory=lambda item: self._t("show_panel"),
             close_label_factory=lambda item: self._t("close"),
-            restore_callback=lambda: self.root.after(0, self.show_panel),
-            close_callback=lambda: self.root.after(0, self.close),
+            restore_callback=lambda: self.tray_action_queue.put("show"),
+            close_callback=lambda: self.tray_action_queue.put("close"),
         )
 
         self.root.title(self._t("title"))
+        self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", self.opacity_percent / 100)
-        self.root.overrideredirect(True)
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -681,8 +745,11 @@ class UsageWidget:
             self.tray_controller.start()
         self._sync_tray()
 
+        if self.show_on_start:
+            self.root.after_idle(self._show_initial_panel)
         self.root.after(100, self.connect)
         self.root.after(200, self._drain_worker_queue)
+        self.root.after(200, self._drain_tray_action_queue)
         self.root.after(500, self._poll_notifications)
 
     def _build_ui(self) -> None:
@@ -697,6 +764,8 @@ class UsageWidget:
 
         self.frame = ttk.Frame(self.root, style="Window.TFrame", padding=(12, 10))
         self.frame.grid(row=0, column=0, sticky="nsew")
+        self.root.columnconfigure(0, weight=1)
+        self.frame.columnconfigure(0, weight=1, minsize=CARD_WIDTH)
 
         self.toolbar = ttk.Frame(self.frame, style="Toolbar.TFrame")
         self.toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -745,20 +814,28 @@ class UsageWidget:
 
         self._bind_context_menu(self.root)
 
-    def _make_icon_button(self, parent: tk.Widget, text: str, command: Callable[[], None]) -> tk.Button:
-        return tk.Button(
+    def _make_icon_button(self, parent: tk.Widget, text: str, command: Callable[[], None]) -> tk.Label:
+        theme = THEMES[self.theme_name]
+        button = tk.Label(
             parent,
             text=text,
-            command=command,
             width=3,
             height=1,
-            borderwidth=0,
-            relief="flat",
+            borderwidth=1,
+            relief="solid",
             cursor="hand2",
             font=("Segoe UI", 11, "bold"),
-            takefocus=False,
-            activebackground=THEMES[self.theme_name]["button_hover"],
+            bg=theme["button_bg"],
+            fg=theme["text"],
+            activebackground=theme["button_hover"],
+            activeforeground=theme["text"],
+            highlightthickness=0,
         )
+        button._usage_widget_control = True
+        button.bind("<Enter>", lambda event: button.configure(bg=THEMES[self.theme_name]["button_hover"]))
+        button.bind("<Leave>", lambda event: button.configure(bg=THEMES[self.theme_name]["button_bg"]))
+        button.bind("<ButtonRelease-1>", lambda event: command())
+        return button
 
     def _t(self, key: str, **kwargs: Any) -> str:
         text = TRANSLATIONS.get(self.language, TRANSLATIONS["en"]).get(key, TRANSLATIONS["en"].get(key, key))
@@ -828,8 +905,8 @@ class UsageWidget:
             button.configure(
                 bg=theme["button_bg"],
                 fg=theme["text"],
-                activebackground=theme["button_hover"],
-                activeforeground=theme["text"],
+                highlightbackground=theme["card_border"],
+                highlightcolor=theme["card_active"],
             )
 
         self.theme_button.configure(text=self._theme_button_text())
@@ -897,7 +974,7 @@ class UsageWidget:
         self.tray_controller.update(main_remaining_percent(self.last_snapshots), self.theme_name)
 
     def _bind_drag(self, widget: tk.Widget) -> None:
-        if isinstance(widget, (tk.Button, tk.Scale, ttk.Scale)):
+        if _is_interactive_control(widget):
             return
         widget.bind("<ButtonPress-1>", self._on_drag_start)
         widget.bind("<B1-Motion>", self._on_drag_move)
@@ -905,7 +982,7 @@ class UsageWidget:
             self._bind_drag(child)
 
     def _bind_double_click_to_tray(self, widget: tk.Widget) -> None:
-        if isinstance(widget, (tk.Button, tk.Scale, ttk.Scale)):
+        if _is_interactive_control(widget):
             return
         widget.bind("<Double-Button-1>", self.hide_to_tray, add="+")
         for child in widget.winfo_children():
@@ -947,7 +1024,13 @@ class UsageWidget:
         self.root.withdraw()
         self._sync_tray()
 
+    def _show_initial_panel(self) -> None:
+        self.root.update_idletasks()
+        self.root.overrideredirect(True)
+        self.show_panel()
+
     def show_panel(self) -> None:
+        self.root.overrideredirect(True)
         self.root.deiconify()
         self.root.lift()
         self.root.attributes("-topmost", True)
@@ -1000,6 +1083,21 @@ class UsageWidget:
 
         self.root.after(200, self._drain_worker_queue)
 
+    def _drain_tray_action_queue(self) -> None:
+        while True:
+            try:
+                action = self.tray_action_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if action == "show":
+                self.show_panel()
+            elif action == "close":
+                self.close()
+                return
+
+        self.root.after(200, self._drain_tray_action_queue)
+
     def _poll_notifications(self) -> None:
         client = self.client
         if client is not None:
@@ -1026,6 +1124,8 @@ class UsageWidget:
         self.last_snapshots = snapshots
         self.card_frames = []
         theme = THEMES[self.theme_name]
+        total_cards_width = len(snapshots) * CARD_WIDTH + max(0, len(snapshots) - 1) * 8
+        self.frame.columnconfigure(0, minsize=total_cards_width)
         for child in self.limits_frame.winfo_children():
             child.destroy()
 

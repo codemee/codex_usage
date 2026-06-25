@@ -12,6 +12,7 @@ from codex_usage_widget import (
     detect_system_language,
     format_tray_tooltip,
     main_remaining_percent,
+    read_macos_user_language,
 )
 
 
@@ -41,18 +42,21 @@ class LayoutConstantTests(unittest.TestCase):
     def test_detects_supported_system_languages(self):
         with (
             patch("codex_usage_widget.read_windows_user_locale", return_value=None),
+            patch("codex_usage_widget.read_macos_user_language", return_value=None),
             patch("codex_usage_widget.locale.getlocale", return_value=("zh_TW", "UTF-8")),
         ):
             self.assertEqual(detect_system_language(), "zh")
 
         with (
             patch("codex_usage_widget.read_windows_user_locale", return_value=None),
+            patch("codex_usage_widget.read_macos_user_language", return_value=None),
             patch("codex_usage_widget.locale.getlocale", return_value=("en_US", "UTF-8")),
         ):
             self.assertEqual(detect_system_language(), "en")
 
         with (
             patch("codex_usage_widget.read_windows_user_locale", return_value=None),
+            patch("codex_usage_widget.read_macos_user_language", return_value=None),
             patch("codex_usage_widget.locale.getlocale", return_value=("ja_JP", "UTF-8")),
         ):
             self.assertEqual(detect_system_language(), "en")
@@ -60,9 +64,27 @@ class LayoutConstantTests(unittest.TestCase):
     def test_windows_user_locale_takes_priority(self):
         with (
             patch("codex_usage_widget.read_windows_user_locale", return_value="zh-TW"),
+            patch("codex_usage_widget.read_macos_user_language", return_value=None),
             patch("codex_usage_widget.locale.getlocale", return_value=("en_US", "UTF-8")),
         ):
             self.assertEqual(detect_system_language(), "zh")
+
+    def test_macos_user_language_is_used_before_locale(self):
+        with (
+            patch("codex_usage_widget.read_windows_user_locale", return_value=None),
+            patch("codex_usage_widget.read_macos_user_language", return_value="zh-Hant-TW"),
+            patch("codex_usage_widget.locale.getlocale", return_value=("en_US", "UTF-8")),
+        ):
+            self.assertEqual(detect_system_language(), "zh")
+
+    def test_reads_first_macos_user_language(self):
+        completed = type(
+            "Completed",
+            (),
+            {"returncode": 0, "stdout": '(\n    "zh-Hant-TW",\n    "en-US"\n)\n'},
+        )()
+        with patch("codex_usage_widget.sys.platform", "darwin"), patch("codex_usage_widget.subprocess.run", return_value=completed):
+            self.assertEqual(read_macos_user_language(), "zh-Hant-TW")
 
     def test_widget_starts_with_prd_controls(self):
         root = tk.Tk()
@@ -81,6 +103,28 @@ class LayoutConstantTests(unittest.TestCase):
             self.assertEqual(widget.opacity_percent, DEFAULT_OPACITY_PERCENT)
             self.assertEqual(widget.language_button.cget("text"), "◎")
             self.assertEqual(widget.theme_button.cget("text"), "◐")
+            self.assertEqual(widget.language_button.cget("bg"), "#3e3d32")
+            self.assertEqual(widget.language_button.cget("fg"), "#f8f8f2")
+        finally:
+            root.destroy()
+
+    def test_toolbar_width_tracks_usage_cards(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            with (
+                patch("codex_usage_widget.detect_system_language", return_value="en"),
+                patch("codex_usage_widget.detect_system_theme", return_value="light"),
+            ):
+                widget = UsageWidget(root, enable_tray=False)
+
+            snapshots = [
+                RateLimitSnapshot("codex", "primary", None, 53, 47, 300, 1, "20:14", "5 hr", 0, None),
+                RateLimitSnapshot("codex", "secondary", None, 90, 10, 10080, 1, "06-28 00:16", "7 day", 0, None),
+            ]
+            widget._show_snapshots(snapshots)
+
+            self.assertGreaterEqual(widget.frame.columnconfigure(0)["minsize"], CARD_WIDTH * 2 + 8)
         finally:
             root.destroy()
 
