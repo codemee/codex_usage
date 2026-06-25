@@ -25,14 +25,22 @@ Always-on-top desktop widget for monitoring Codex usage limits through the Codex
 
 ## Installation
 
+Install from GitHub:
+
 ```powershell
-uv sync
+uv tool install git+https://github.com/codemee/codex_usage.git
+```
+
+Install from a local checkout:
+
+```powershell
+uv tool install .
 ```
 
 ## Run
 
 ```powershell
-uv run python codex_usage_widget.py
+codex-usage-widget
 ```
 
 ## Usage

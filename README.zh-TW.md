@@ -25,14 +25,22 @@
 
 ## 安裝
 
+從 GitHub 安裝：
+
 ```powershell
-uv sync
+uv tool install git+https://github.com/codemee/codex_usage.git
+```
+
+從本機 checkout 安裝：
+
+```powershell
+uv tool install .
 ```
 
 ## 執行
 
 ```powershell
-uv run python codex_usage_widget.py
+codex-usage-widget
 ```
 
 ## 操作

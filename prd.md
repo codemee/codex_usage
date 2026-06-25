@@ -16,3 +16,6 @@
 6. 面板關閉時需完整釋放排程與系統匣資源
     - 關閉前取消待執行的 Tk after callback
     - 視窗銷毀後不可再觸發 worker queue、tray queue、notification polling 或右鍵選單 callback
+7. 工具需支援以 uv tool install 安裝
+    - 專案需提供可安裝的 Python package metadata
+    - 安裝後需提供 `codex-usage-widget` 可執行命令
