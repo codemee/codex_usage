@@ -13,3 +13,6 @@
     - 系統匣圖示以主要剩餘用量動態呈現
     - 滑鼠移到系統匣圖示時，以 tooltip 顯示剩餘用量
     - 雙按系統匣圖示可重新顯示置頂面板
+6. 面板關閉時需完整釋放排程與系統匣資源
+    - 關閉前取消待執行的 Tk after callback
+    - 視窗銷毀後不可再觸發 worker queue、tray queue、notification polling 或右鍵選單 callback

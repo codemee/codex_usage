@@ -89,6 +89,7 @@ class LayoutConstantTests(unittest.TestCase):
     def test_widget_starts_with_prd_controls(self):
         root = tk.Tk()
         root.withdraw()
+        widget = None
         try:
             with (
                 patch("codex_usage_widget.detect_system_language", return_value="zh"),
@@ -106,11 +107,29 @@ class LayoutConstantTests(unittest.TestCase):
             self.assertEqual(widget.language_button.cget("bg"), "#3e3d32")
             self.assertEqual(widget.language_button.cget("fg"), "#f8f8f2")
         finally:
-            root.destroy()
+            if widget is not None:
+                widget.close()
+            else:
+                root.destroy()
+
+    def test_close_cancels_pending_after_jobs(self):
+        root = tk.Tk()
+        root.withdraw()
+        widget = UsageWidget(root, enable_tray=False)
+
+        widget.close()
+
+        self.assertTrue(widget.is_closing)
+        self.assertIsNone(widget.connect_job)
+        self.assertIsNone(widget.worker_queue_job)
+        self.assertIsNone(widget.tray_action_queue_job)
+        self.assertIsNone(widget.notification_poll_job)
+        self.assertIsNone(widget.initial_panel_job)
 
     def test_toolbar_width_tracks_usage_cards(self):
         root = tk.Tk()
         root.withdraw()
+        widget = None
         try:
             with (
                 patch("codex_usage_widget.detect_system_language", return_value="en"),
@@ -126,7 +145,10 @@ class LayoutConstantTests(unittest.TestCase):
 
             self.assertGreaterEqual(widget.frame.columnconfigure(0)["minsize"], CARD_WIDTH * 2 + 8)
         finally:
-            root.destroy()
+            if widget is not None:
+                widget.close()
+            else:
+                root.destroy()
 
     def test_tray_tooltip_uses_primary_remaining_usage(self):
         snapshots = [

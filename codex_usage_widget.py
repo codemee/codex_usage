@@ -708,8 +708,14 @@ class UsageWidget:
         self.tray_action_queue: queue.Queue[str] = queue.Queue()
         self.last_snapshots: list[RateLimitSnapshot] = []
         self.next_refresh_job: str | None = None
+        self.connect_job: str | None = None
+        self.worker_queue_job: str | None = None
+        self.tray_action_queue_job: str | None = None
+        self.notification_poll_job: str | None = None
+        self.initial_panel_job: str | None = None
         self.drag_start: tuple[int, int] | None = None
         self.is_refreshing = False
+        self.is_closing = False
         self.language_mode = "system"
         self.theme_mode = "system"
         self.language = self._resolve_language()
@@ -746,11 +752,11 @@ class UsageWidget:
         self._sync_tray()
 
         if self.show_on_start:
-            self.root.after_idle(self._show_initial_panel)
-        self.root.after(100, self.connect)
-        self.root.after(200, self._drain_worker_queue)
-        self.root.after(200, self._drain_tray_action_queue)
-        self.root.after(500, self._poll_notifications)
+            self.initial_panel_job = self.root.after_idle(self._show_initial_panel)
+        self.connect_job = self.root.after(100, self.connect)
+        self.worker_queue_job = self.root.after(200, self._drain_worker_queue)
+        self.tray_action_queue_job = self.root.after(200, self._drain_tray_action_queue)
+        self.notification_poll_job = self.root.after(500, self._poll_notifications)
 
     def _build_ui(self) -> None:
         style = ttk.Style()
@@ -994,7 +1000,12 @@ class UsageWidget:
             self._bind_context_menu(child)
 
     def _show_context_menu(self, event: tk.Event) -> None:
-        self.context_menu.tk_popup(event.x_root, event.y_root)
+        if self.is_closing or not self.root.winfo_exists():
+            return
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        except tk.TclError:
+            return
 
     def _on_drag_start(self, event: tk.Event) -> None:
         self.drag_start = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
@@ -1006,10 +1017,15 @@ class UsageWidget:
         self.root.geometry(f"+{event.x_root - x_offset}+{event.y_root - y_offset}")
 
     def connect(self) -> None:
+        self.connect_job = None
+        if self.is_closing:
+            return
         self._cancel_scheduled_refresh()
         self._run_worker(self._connect_and_refresh)
 
     def reconnect(self) -> None:
+        if self.is_closing:
+            return
         if self.client is not None:
             self.client.stop()
         self.client = None
@@ -1017,19 +1033,28 @@ class UsageWidget:
         self.connect()
 
     def refresh_now(self) -> None:
+        if self.is_closing:
+            return
         self._cancel_scheduled_refresh()
         self._run_worker(self._refresh_worker)
 
     def hide_to_tray(self, event: tk.Event | None = None) -> None:
+        if self.is_closing:
+            return
         self.root.withdraw()
         self._sync_tray()
 
     def _show_initial_panel(self) -> None:
+        self.initial_panel_job = None
+        if self.is_closing:
+            return
         self.root.update_idletasks()
         self.root.overrideredirect(True)
         self.show_panel()
 
     def show_panel(self) -> None:
+        if self.is_closing:
+            return
         self.root.overrideredirect(True)
         self.root.deiconify()
         self.root.lift()
@@ -1037,10 +1062,19 @@ class UsageWidget:
         self.root.focus_force()
 
     def close(self) -> None:
+        if self.is_closing:
+            return
+        self.is_closing = True
+        self._cancel_all_after_jobs()
         if self.client is not None:
             self.client.stop()
+            self.client = None
         self.tray_controller.stop()
-        self.root.destroy()
+        try:
+            if self.root.winfo_exists():
+                self.root.destroy()
+        except tk.TclError:
+            pass
 
     def _connect_and_refresh(self) -> None:
         try:
@@ -1062,12 +1096,15 @@ class UsageWidget:
             self.worker_queue.put(("error", str(exc)))
 
     def _run_worker(self, target: Callable[[], None]) -> None:
-        if self.is_refreshing:
+        if self.is_closing or self.is_refreshing:
             return
         self.is_refreshing = True
         threading.Thread(target=target, daemon=True).start()
 
     def _drain_worker_queue(self) -> None:
+        self.worker_queue_job = None
+        if self.is_closing:
+            return
         while True:
             try:
                 kind, payload = self.worker_queue.get_nowait()
@@ -1081,9 +1118,13 @@ class UsageWidget:
                 self._show_error(str(payload))
             self._schedule_refresh()
 
-        self.root.after(200, self._drain_worker_queue)
+        if not self.is_closing:
+            self.worker_queue_job = self.root.after(200, self._drain_worker_queue)
 
     def _drain_tray_action_queue(self) -> None:
+        self.tray_action_queue_job = None
+        if self.is_closing:
+            return
         while True:
             try:
                 action = self.tray_action_queue.get_nowait()
@@ -1096,9 +1137,13 @@ class UsageWidget:
                 self.close()
                 return
 
-        self.root.after(200, self._drain_tray_action_queue)
+        if not self.is_closing:
+            self.tray_action_queue_job = self.root.after(200, self._drain_tray_action_queue)
 
     def _poll_notifications(self) -> None:
+        self.notification_poll_job = None
+        if self.is_closing:
+            return
         client = self.client
         if client is not None:
             while True:
@@ -1113,7 +1158,8 @@ class UsageWidget:
                             self._show_snapshots(parse_rate_limit_snapshots(params))
                         except ValueError:
                             pass
-        self.root.after(500, self._poll_notifications)
+        if not self.is_closing:
+            self.notification_poll_job = self.root.after(500, self._poll_notifications)
 
     def _show_snapshots(self, snapshots: Iterable[RateLimitSnapshot]) -> None:
         snapshots = list(snapshots)
@@ -1225,13 +1271,35 @@ class UsageWidget:
         self.status_label.configure(text=text, style="WindowError.TLabel" if self.status_is_error else "Window.TLabel")
 
     def _schedule_refresh(self) -> None:
+        if self.is_closing:
+            return
         self._cancel_scheduled_refresh()
         self.next_refresh_job = self.root.after(REFRESH_INTERVAL_SECONDS * 1000, self.refresh_now)
 
     def _cancel_scheduled_refresh(self) -> None:
         if self.next_refresh_job is not None:
-            self.root.after_cancel(self.next_refresh_job)
+            try:
+                self.root.after_cancel(self.next_refresh_job)
+            except tk.TclError:
+                pass
             self.next_refresh_job = None
+
+    def _cancel_after_job(self, attribute_name: str) -> None:
+        job = getattr(self, attribute_name)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+            setattr(self, attribute_name, None)
+
+    def _cancel_all_after_jobs(self) -> None:
+        self._cancel_scheduled_refresh()
+        self._cancel_after_job("connect_job")
+        self._cancel_after_job("worker_queue_job")
+        self._cancel_after_job("tray_action_queue_job")
+        self._cancel_after_job("notification_poll_job")
+        self._cancel_after_job("initial_panel_job")
 
 
 def main() -> None:
