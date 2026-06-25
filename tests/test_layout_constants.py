@@ -1,7 +1,18 @@
 import unittest
 import tkinter as tk
+from unittest.mock import patch
 
-from codex_usage_widget import CARD_HEIGHT, CARD_WIDTH
+from codex_usage_widget import (
+    CARD_HEIGHT,
+    CARD_WIDTH,
+    DEFAULT_OPACITY_PERCENT,
+    RateLimitSnapshot,
+    UsageWidget,
+    create_tray_icon_image,
+    detect_system_language,
+    format_tray_tooltip,
+    main_remaining_percent,
+)
 
 
 class LayoutConstantTests(unittest.TestCase):
@@ -23,6 +34,72 @@ class LayoutConstantTests(unittest.TestCase):
 
         self.assertLessEqual(required_width, CARD_WIDTH)
         self.assertLessEqual(required_height, CARD_HEIGHT)
+
+    def test_default_opacity_matches_product_requirement(self):
+        self.assertEqual(DEFAULT_OPACITY_PERCENT, 75)
+
+    def test_detects_supported_system_languages(self):
+        with (
+            patch("codex_usage_widget.read_windows_user_locale", return_value=None),
+            patch("codex_usage_widget.locale.getlocale", return_value=("zh_TW", "UTF-8")),
+        ):
+            self.assertEqual(detect_system_language(), "zh")
+
+        with (
+            patch("codex_usage_widget.read_windows_user_locale", return_value=None),
+            patch("codex_usage_widget.locale.getlocale", return_value=("en_US", "UTF-8")),
+        ):
+            self.assertEqual(detect_system_language(), "en")
+
+        with (
+            patch("codex_usage_widget.read_windows_user_locale", return_value=None),
+            patch("codex_usage_widget.locale.getlocale", return_value=("ja_JP", "UTF-8")),
+        ):
+            self.assertEqual(detect_system_language(), "en")
+
+    def test_windows_user_locale_takes_priority(self):
+        with (
+            patch("codex_usage_widget.read_windows_user_locale", return_value="zh-TW"),
+            patch("codex_usage_widget.locale.getlocale", return_value=("en_US", "UTF-8")),
+        ):
+            self.assertEqual(detect_system_language(), "zh")
+
+    def test_widget_starts_with_prd_controls(self):
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            with (
+                patch("codex_usage_widget.detect_system_language", return_value="zh"),
+                patch("codex_usage_widget.detect_system_theme", return_value="dark"),
+            ):
+                widget = UsageWidget(root, enable_tray=False)
+
+            self.assertEqual(widget.language_mode, "system")
+            self.assertEqual(widget.theme_mode, "system")
+            self.assertEqual(widget.language, "zh")
+            self.assertEqual(widget.theme_name, "dark")
+            self.assertEqual(widget.opacity_percent, DEFAULT_OPACITY_PERCENT)
+            self.assertEqual(widget.language_button.cget("text"), "◎")
+            self.assertEqual(widget.theme_button.cget("text"), "◐")
+        finally:
+            root.destroy()
+
+    def test_tray_tooltip_uses_primary_remaining_usage(self):
+        snapshots = [
+            RateLimitSnapshot("codex", "primary", None, 25, 75, 300, 1, "10:00", "5 hr", None, None),
+            RateLimitSnapshot("codex_week", "primary", None, 40, 60, 10080, 1, "06-30 10:00", "7 day", None, None),
+        ]
+
+        remaining = main_remaining_percent(snapshots)
+
+        self.assertEqual(remaining, 75)
+        self.assertEqual(format_tray_tooltip("Codex Usage", remaining), "Codex Usage: 75%")
+
+    def test_tray_icon_image_is_generated(self):
+        image = create_tray_icon_image(75, "dark")
+
+        self.assertEqual(image.size, (64, 64))
+        self.assertEqual(image.mode, "RGBA")
 
 
 if __name__ == "__main__":
