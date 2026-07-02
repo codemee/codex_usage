@@ -18,6 +18,91 @@ import pystray
 from PIL import Image, ImageDraw, ImageFont
 
 
+def _patch_pystray_menu_redraw() -> None:
+    """Fix a Windows ghost-menu artifact left by the tray icon's popup menu.
+
+    Per MSDN's TrackPopupMenu remarks, the caller must post a benign message
+    back to the window right after the menu is dismissed, or the desktop
+    never repaints the area under the menu (it stays a white block until the
+    next click). pystray's win32 backend skips this step.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        from pystray._util import win32 as pystray_win32
+    except ImportError:
+        return
+
+    original_track_popup_menu_ex = pystray_win32.TrackPopupMenuEx
+
+    def _track_popup_menu_ex_and_flush(hmenu, flags, x, y, hwnd, tpm_params):
+        result = original_track_popup_menu_ex(hmenu, flags, x, y, hwnd, tpm_params)
+        pystray_win32.PostMessage(hwnd, 0, 0, 0)  # WM_NULL
+        return result
+
+    pystray_win32.TrackPopupMenuEx = _track_popup_menu_ex_and_flush
+
+
+_patch_pystray_menu_redraw()
+
+
+def _force_desktop_repaint() -> None:
+    """Force Windows to redraw the whole desktop.
+
+    Closing this layered, topmost, undecorated widget (or dismissing its
+    popup menu right beforehand) can leave the desktop compositor with a
+    stale bitmap of it on screen — a ghost block that only clears once
+    something else happens to invalidate that screen region. Explicitly
+    redrawing the desktop here clears it immediately instead of leaving the
+    user to click somewhere to trigger it by accident.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        RDW_INVALIDATE = 0x0001
+        RDW_ERASE = 0x0004
+        RDW_ALLCHILDREN = 0x0080
+        RDW_UPDATENOW = 0x0100
+        ctypes.windll.user32.RedrawWindow(
+            None, None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW
+        )
+    except Exception:
+        pass
+
+
+def _clear_layered_window_style(hwnd: int) -> None:
+    """Strip WS_EX_LAYERED from the widget's window before destroying it.
+
+    This window is alpha-blended (WS_EX_LAYERED) for the opacity slider.
+    Windows keeps a separate composited surface for layered windows, and
+    destroying one right after a native popup menu closes over it can leave
+    that surface's last frame on screen. Dropping back to a normal opaque
+    window right before destroy avoids that ghost surface entirely.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED = 0x00080000
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_NOZORDER = 0x0004
+        SWP_FRAMECHANGED = 0x0020
+
+        current = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, current & ~WS_EX_LAYERED)
+        ctypes.windll.user32.SetWindowPos(
+            hwnd, None, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        )
+    except Exception:
+        pass
+
+
 REQUEST_TIMEOUT_SECONDS = 10.0
 REFRESH_INTERVAL_SECONDS = 60
 CARD_WIDTH = 128
@@ -812,11 +897,20 @@ class UsageWidget:
         self.status_label = ttk.Label(self.frame, text="", style="Window.TLabel", justify="left")
         self.status_label.grid(row=2, column=0, sticky="w", pady=(6, 0))
 
-        self.context_menu = tk.Menu(self.root, tearoff=0)
-        self.context_menu.add_command(label=self._t("refresh_now"), command=self.refresh_now)
-        self.context_menu.add_command(label=self._t("reconnect"), command=self.reconnect)
-        self.context_menu.add_separator()
-        self.context_menu.add_command(label=self._t("close"), command=self.close)
+        self._context_menu_popup: tk.Toplevel | None = None
+        if sys.platform == "win32":
+            # Windows' native popup menu (tk.Menu/tk_popup, backed by
+            # TrackPopupMenu) leaves a permanent ghost rectangle on screen if
+            # the owning window is destroyed while it's still tearing down
+            # (see close()/"close" below). A hand-drawn Toplevel menu doesn't
+            # go through that native code path, so it sidesteps the bug.
+            self.context_menu = None
+        else:
+            self.context_menu = tk.Menu(self.root, tearoff=0)
+            self.context_menu.add_command(label=self._t("refresh_now"), command=self.refresh_now)
+            self.context_menu.add_command(label=self._t("reconnect"), command=self.reconnect)
+            self.context_menu.add_separator()
+            self.context_menu.add_command(label=self._t("close"), command=self.close)
 
         self._bind_context_menu(self.root)
 
@@ -932,9 +1026,10 @@ class UsageWidget:
     def _refresh_labels(self) -> None:
         self.language = self._resolve_language()
         self.root.title(self._t("title"))
-        self.context_menu.entryconfigure(0, label=self._t("refresh_now"))
-        self.context_menu.entryconfigure(1, label=self._t("reconnect"))
-        self.context_menu.entryconfigure(3, label=self._t("close"))
+        if self.context_menu is not None:
+            self.context_menu.entryconfigure(0, label=self._t("refresh_now"))
+            self.context_menu.entryconfigure(1, label=self._t("reconnect"))
+            self.context_menu.entryconfigure(3, label=self._t("close"))
         self.language_button.configure(text=self._language_button_text())
         self._render_status()
         if self.last_snapshots:
@@ -1002,10 +1097,88 @@ class UsageWidget:
     def _show_context_menu(self, event: tk.Event) -> None:
         if self.is_closing or not self.root.winfo_exists():
             return
-        try:
-            self.context_menu.tk_popup(event.x_root, event.y_root)
-        except tk.TclError:
+        if self.context_menu is not None:
+            try:
+                self.context_menu.tk_popup(event.x_root, event.y_root)
+            except tk.TclError:
+                pass
             return
+
+        self._dismiss_context_menu()
+
+        # Windows only: a plain Toplevel is used here instead of
+        # tk.Menu/tk_popup. On Windows, tk_popup goes through the native
+        # TrackPopupMenu API, and destroying this window (via "close") while
+        # that popup is still tearing down leaves a permanent ghost
+        # rectangle on screen that nothing short of restarting the desktop
+        # compositor clears. A Toplevel doesn't go through that native menu
+        # code path, so it doesn't hit the bug.
+        theme = THEMES[self.theme_name]
+        popup = tk.Toplevel(self.root)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        popup.configure(bg=theme["card_border"])
+
+        inner = tk.Frame(popup, bg=theme["card_bg"], bd=0)
+        inner.pack(padx=1, pady=1)
+
+        entries = [
+            ("refresh_now", self.refresh_now),
+            ("reconnect", self.reconnect),
+            None,
+            ("close", self.close),
+        ]
+        for entry in entries:
+            if entry is None:
+                tk.Frame(inner, bg=theme["card_border"], height=1).pack(fill="x", padx=6, pady=4)
+                continue
+            key, command = entry
+            label = tk.Label(
+                inner,
+                text=self._t(key),
+                bg=theme["card_bg"],
+                fg=theme["text"],
+                anchor="w",
+                padx=14,
+                pady=5,
+                font=("Segoe UI", 9),
+                cursor="hand2",
+            )
+            label.pack(fill="x")
+            label.bind("<Enter>", lambda _e, w=label: w.configure(bg=theme["button_hover"]))
+            label.bind("<Leave>", lambda _e, w=label: w.configure(bg=theme["card_bg"]))
+            label.bind("<ButtonRelease-1>", lambda _e, cmd=command: self._on_context_menu_select(cmd))
+
+        popup.update_idletasks()
+        x, y = event.x_root, event.y_root
+        screen_w = popup.winfo_screenwidth()
+        screen_h = popup.winfo_screenheight()
+        width = popup.winfo_reqwidth()
+        height = popup.winfo_reqheight()
+        if x + width > screen_w:
+            x = max(0, screen_w - width)
+        if y + height > screen_h:
+            y = max(0, screen_h - height)
+        popup.geometry(f"+{x}+{y}")
+        popup.bind("<FocusOut>", lambda _e: self._dismiss_context_menu())
+        popup.bind("<Escape>", lambda _e: self._dismiss_context_menu())
+        popup.grab_set()
+        popup.focus_set()
+        self._context_menu_popup = popup
+
+    def _on_context_menu_select(self, command: Callable[[], None]) -> None:
+        self._dismiss_context_menu()
+        command()
+
+    def _dismiss_context_menu(self, event: tk.Event | None = None) -> None:
+        popup = self._context_menu_popup
+        self._context_menu_popup = None
+        if popup is not None:
+            try:
+                popup.grab_release()
+                popup.destroy()
+            except tk.TclError:
+                pass
 
     def _on_drag_start(self, event: tk.Event) -> None:
         self.drag_start = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
@@ -1072,9 +1245,11 @@ class UsageWidget:
         self.tray_controller.stop()
         try:
             if self.root.winfo_exists():
+                _clear_layered_window_style(self.root.winfo_id())
                 self.root.destroy()
         except tk.TclError:
             pass
+        _force_desktop_repaint()
 
     def _connect_and_refresh(self) -> None:
         try:
