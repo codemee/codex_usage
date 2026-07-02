@@ -2,6 +2,8 @@
 
 [繁體中文](README.zh-TW.md)
 
+Developer documentation: [Architecture](docs/architecture.md)
+
 Always-on-top desktop widget for monitoring Codex usage limits through the Codex app-server.
 
 ## Features
@@ -41,6 +43,28 @@ uv tool install .
 
 ```powershell
 codex-usage-widget
+```
+
+## Development
+
+```powershell
+git clone https://github.com/codemee/codex_usage.git
+cd codex_usage
+uv sync
+uv run codex-usage-widget
+uv run python -m unittest discover -s tests
+```
+
+`codex` must be available on `PATH` and authenticated before the widget can read usage data. The project currently uses a single application module; see the [architecture document](docs/architecture.md) for component boundaries, data flow, threading rules, and extension guidance.
+
+## Project structure
+
+```text
+codex_usage_widget.py   Application, app-server client, parsing, UI, and tray integration
+tests/                  Unit and Tk layout tests
+docs/                   Developer architecture documentation
+pyproject.toml          Package metadata, dependencies, and CLI entry point
+prd.md                  Product requirements implemented by the widget
 ```
 
 ## Usage

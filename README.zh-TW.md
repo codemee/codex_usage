@@ -2,6 +2,8 @@
 
 [English](README.md)
 
+開發文件：[系統架構](docs/architecture.zh-TW.md)
+
 透過 Codex app-server 監控 Codex 用量限制的置頂桌面小工具。
 
 ## 功能
@@ -41,6 +43,28 @@ uv tool install .
 
 ```powershell
 codex-usage-widget
+```
+
+## 開發者快速開始
+
+```powershell
+git clone https://github.com/codemee/codex_usage.git
+cd codex_usage
+uv sync
+uv run codex-usage-widget
+uv run python -m unittest discover -s tests
+```
+
+啟動前須確認 `codex` 已加入 `PATH` 且完成登入，否則小工具無法讀取用量。目前應用程式集中於單一 Python 模組；元件邊界、資料流、執行緒規則與擴充方式請見[系統架構文件](docs/architecture.zh-TW.md)。
+
+## 專案結構
+
+```text
+codex_usage_widget.py   應用程式、app-server client、資料解析、UI 與系統匣整合
+tests/                  單元測試與 Tk 版面測試
+docs/                   開發者架構文件
+pyproject.toml          套件資訊、相依套件與 CLI 進入點
+prd.md                  小工具目前實作所依據的產品需求
 ```
 
 ## 操作
